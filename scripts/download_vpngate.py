@@ -39,17 +39,7 @@ def main() -> None:
     with urllib.request.urlopen(request, timeout=30) as response:
         raw = response.read().decode("utf-8-sig", errors="replace")
 
-    lines = [
-        line
-        for line in raw.splitlines()
-        if line.strip() and not line.startswith("#")
-    ]
-
-    if not lines:
-        raise RuntimeError("VPN Gate API returned no data")
-
-    rows = list(csv.reader(io.StringIO("\n".join(lines))))
-    header = rows[0]
+    raw_lines = [line for line in raw.splitlines() if line.strip()]\r\n\r\n    # VPN Gate CSV keeps its header as a comment beginning with #HostName.\r\n    header_index = next((i for i, line in enumerate(raw_lines) if line.lstrip().startswith("#HostName,")), None)\r\n    if header_index is None:\r\n        raise RuntimeError("VPN Gate API returned no CSV header")\r\n\r\n    header_line = raw_lines[header_index].lstrip()[1:]\r\n    data_lines = [line for line in raw_lines[header_index + 1:] if not line.lstrip().startswith("#")]\r\n\r\n    rows = list(csv.reader(io.StringIO("\n".join([header_line, *data_lines]))))\r\n    header = rows[0]
 
     records = [
         dict(zip(header, row))
@@ -141,3 +131,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
