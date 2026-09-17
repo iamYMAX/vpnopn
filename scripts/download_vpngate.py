@@ -14,19 +14,18 @@ API_URL = "https://www.vpngate.net/api/iphone/"
 OUTPUT_DIR = Path("configs")
 MANIFEST = Path("servers.json")
 MAX_SERVERS = int(os.getenv("MAX_SERVERS", "20"))
-EXCLUDED_COUNTRIES = {"RU"}
 
-def safe_name(value: str) -> str:
+def safe_name(value):
     value = re.sub(r"[^A-Za-z0-9._-]+", "_", value.strip())
     return value.strip("._") or "server"
 
-def number(value: str, default: float = 0.0) -> float:
+def number(value, default=0.0):
     try:
         return float(value)
     except (TypeError, ValueError):
         return default
 
-def decode_config(value: str) -> str | None:
+def decode_config(value):
     if not value:
         return None
 
@@ -34,117 +33,166 @@ def decode_config(value: str) -> str | None:
     encoded += "=" * (-len(encoded) % 4)
 
     try:
-        config = base64.b64decode(encoded, validate=False)
-        text = config.decode("utf-8", errors="replace")
+        decoded = base64.b64decode(encoded, validate=False)
+        return decoded.decode("utf-8", errors="replace")
     except Exception:
         return None
 
-    normalized = text.lower()
-
-    if "client" not in normalized:
-        return None
-
-    if not re.search(r"(?m)^\s*remote\s+", text):
-        return None
-
-    return text
-
-def main() -> None:
+def main():
     request = urllib.request.Request(
         API_URL,
-        headers={"User-Agent": "vpnopn-github-actions/1.0"},
+        headers={
+            "User-Agent": "vpnopn-github-actions/1.0"
+        },
     )
 
-    with urllib.request.urlopen(request, timeout=30) as response:
+    print("Downloading VPN Gate API...")
+
+    with urllib.request.urlopen(request, timeout=60) as response:
         raw = response.read().decode("utf-8-sig", errors="replace")
 
-    raw_lines = [line for line in raw.splitlines() if line.strip()]
+    print(f"Downloaded bytes: {len(raw)}")
 
-    header_index = next(
-        (
-            i
-            for i, line in enumerate(raw_lines)
-            if line.lstrip().startswith("#HostName,")
-        ),
-        None,
-    )
+    lines = [line for line in raw.splitlines() if line.strip()]
+
+    print(f"Non-empty lines: {len(lines)}")
+
+    header_index = None
+
+    for i, line in enumerate(lines):
+        if line.lstrip().startswith("#HostName,"):
+            header_index = i
+            break
 
     if header_index is None:
+        print("ERROR: CSV header #HostName was not found")
+        print("First 10 lines:")
+        for line in lines[:10]:
+            print(repr(line))
         raise RuntimeError("VPN Gate API returned no CSV header")
 
-    header_line = raw_lines[header_index].lstrip()[1:]
+    header_line = lines[header_index].lstrip()[1:]
 
-    data_lines = [
-        line
-        for line in raw_lines[header_index + 1:]
-        if not line.lstrip().startswith("#")
-    ]
+    print("CSV header found")
+    print(f"Header fields: {len(next(csv.reader([header_line])))}")
 
-    rows = list(
-        csv.reader(
-            io.StringIO("\n".join([header_line, *data_lines]))
-        )
-    )
+    data_lines = lines[header_index + 1:]
+
+    print(f"Data lines: {len(data_lines)}")
+
+    csv_text = "\n".join([header_line] + data_lines)
+
+    rows = list(csv.reader(io.StringIO(csv_text)))
 
     header = rows[0]
 
-    records = [
-        dict(zip(header, row))
-        for row in rows[1:]
-        if len(row) >= len(header)
-    ]
+    print("Columns:")
+    for index, column in enumerate(header):
+        print(f"  {index}: {column}")
 
-    candidates = []
-    excluded = 0
-    missing_config = 0
-    invalid_config = 0
+    records = []
 
-    for row in records:
-        country = row.get("CountryShort", "").strip().upper()
+    for row in rows[1:]:
+        if len(row) >= len(header):
+            records.append(dict(zip(header, row)))
 
-        if country in EXCLUDED_COUNTRIES:
-            excluded += 1
+    print(f"Parsed records: {len(records)}")
+
+    if not records:
+        raise RuntimeError("VPN Gate returned zero parsed server records")
+
+    country_counts = {}
+
+    for record in records:
+        country = record.get("CountryShort", "").strip().upper()
+        country_counts[country] = country_counts.get(country, 0) + 1
+
+    print("Countries:")
+    for country, count in sorted(country_counts.items(), key=lambda x: -x[1])[:30]:
+        print(f"  {country or '<EMPTY>'}: {count}")
+
+    excluded_ru = 0
+    missing_base64 = 0
+    invalid_base64 = 0
+    no_client_remote = 0
+    usable = []
+
+    for record in records:
+
+        country = record.get("CountryShort", "").strip().upper()
+
+        if country == "RU":
+            excluded_ru += 1
             continue
 
-        config_value = row.get(
+        config_b64 = record.get(
             "OpenVPN_ConfigData_Base64",
             ""
         ).strip()
 
-        config_text = decode_config(config_value)
-
-        if config_text is None:
-            if config_value:
-                invalid_config += 1
-            else:
-                missing_config += 1
+        if not config_b64:
+            missing_base64 += 1
             continue
 
-        candidates.append(
+        config = decode_config(config_b64)
+
+        if config is None:
+            invalid_base64 += 1
+            continue
+
+        normalized = config.lower()
+
+        has_client = "client" in normalized
+        has_remote = bool(
+            re.search(r"(?m)^\s*remote\s+", config)
+        )
+
+        if not has_client or not has_remote:
+            no_client_remote += 1
+
+            if no_client_remote <= 3:
+                print()
+                print("Decoded config rejected:")
+                print(f"Host: {record.get('HostName')}")
+                print(f"IP: {record.get('IP')}")
+                print(f"Country: {country}")
+                print(f"Has client: {has_client}")
+                print(f"Has remote: {has_remote}")
+                print("Config beginning:")
+                print(config[:500])
+
+            continue
+
+        usable.append(
             {
-                "hostname": row.get("HostName", "").strip(),
-                "ip": row.get("IP", "").strip(),
-                "country": row.get("CountryLong", "").strip(),
+                "hostname": record.get("HostName", "").strip(),
+                "ip": record.get("IP", "").strip(),
+                "country": record.get("CountryLong", "").strip(),
                 "country_code": country,
-                "score": number(row.get("Score")),
-                "ping_ms": number(row.get("Ping"), -1),
-                "speed": number(row.get("Speed")),
-                "sessions": int(
-                    number(row.get("NumVpnSessions"), 0)
-                ),
-                "config": config_text,
+                "score": number(record.get("Score")),
+                "ping_ms": number(record.get("Ping"), -1),
+                "speed": number(record.get("Speed")),
+                "sessions": int(number(record.get("NumVpnSessions"), 0)),
+                "config": config,
             }
         )
 
-    print(
-        f"VPN Gate rows: {len(records)}; "
-        f"excluded RU: {excluded}; "
-        f"missing configs: {missing_config}; "
-        f"invalid configs: {invalid_config}; "
-        f"usable: {len(candidates)}"
-    )
+    print()
+    print("========== VPN GATE DIAGNOSTICS ==========")
+    print(f"Total records:       {len(records)}")
+    print(f"Excluded RU:         {excluded_ru}")
+    print(f"Missing Base64:      {missing_base64}")
+    print(f"Invalid Base64:      {invalid_base64}")
+    print(f"No client/remote:    {no_client_remote}")
+    print(f"Usable configs:      {len(usable)}")
+    print("===========================================")
 
-    candidates.sort(
+    if not usable:
+        raise RuntimeError(
+            "No usable non-RU OpenVPN configurations found"
+        )
+
+    usable.sort(
         key=lambda server: (
             -server["score"],
             -server["speed"],
@@ -154,12 +202,7 @@ def main() -> None:
         )
     )
 
-    selected = candidates[:MAX_SERVERS]
-
-    if not selected:
-        raise RuntimeError(
-            "No usable non-RU OpenVPN configurations found"
-        )
+    selected = usable[:MAX_SERVERS]
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -169,6 +212,7 @@ def main() -> None:
     manifest = []
 
     for server in selected:
+
         filename = f"{safe_name(server['hostname'])}.ovpn"
 
         (OUTPUT_DIR / filename).write_text(
@@ -178,8 +222,8 @@ def main() -> None:
 
         manifest.append(
             {
-                key: server[key]
-                for key in server
+                key: value
+                for key, value in server.items()
                 if key != "config"
             }
             | {
@@ -192,14 +236,11 @@ def main() -> None:
             manifest,
             ensure_ascii=False,
             indent=2,
-        )
-        + "\n",
+        ) + "\n",
         encoding="utf-8",
     )
 
-    print(
-        f"Saved {len(selected)} OpenVPN configurations"
-    )
+    print(f"Saved {len(selected)} OpenVPN configurations")
 
 if __name__ == "__main__":
     main()
