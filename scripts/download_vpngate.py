@@ -1,5 +1,4 @@
 ﻿#!/usr/bin/env python3
-
 from __future__ import annotations
 
 import base64
@@ -17,11 +16,9 @@ MANIFEST = Path("servers.json")
 MAX_SERVERS = int(os.getenv("MAX_SERVERS", "20"))
 EXCLUDED_COUNTRIES = {"RU"}
 
-
 def safe_name(value: str) -> str:
     value = re.sub(r"[^A-Za-z0-9._-]+", "_", value.strip())
     return value.strip("._") or "server"
-
 
 def number(value: str, default: float = 0.0) -> float:
     try:
@@ -29,6 +26,28 @@ def number(value: str, default: float = 0.0) -> float:
     except (TypeError, ValueError):
         return default
 
+def decode_config(value: str) -> str | None:
+    if not value:
+        return None
+
+    encoded = re.sub(r"\s+", "", value)
+    encoded += "=" * (-len(encoded) % 4)
+
+    try:
+        config = base64.b64decode(encoded, validate=False)
+        text = config.decode("utf-8", errors="replace")
+    except Exception:
+        return None
+
+    normalized = text.lower()
+
+    if "client" not in normalized:
+        return None
+
+    if not re.search(r"(?m)^\s*remote\s+", text):
+        return None
+
+    return text
 
 def main() -> None:
     request = urllib.request.Request(
@@ -39,7 +58,35 @@ def main() -> None:
     with urllib.request.urlopen(request, timeout=30) as response:
         raw = response.read().decode("utf-8-sig", errors="replace")
 
-    raw_lines = [line for line in raw.splitlines() if line.strip()]\r\n\r\n    # VPN Gate CSV keeps its header as a comment beginning with #HostName.\r\n    header_index = next((i for i, line in enumerate(raw_lines) if line.lstrip().startswith("#HostName,")), None)\r\n    if header_index is None:\r\n        raise RuntimeError("VPN Gate API returned no CSV header")\r\n\r\n    header_line = raw_lines[header_index].lstrip()[1:]\r\n    data_lines = [line for line in raw_lines[header_index + 1:] if not line.lstrip().startswith("#")]\r\n\r\n    rows = list(csv.reader(io.StringIO("\n".join([header_line, *data_lines]))))\r\n    header = rows[0]
+    raw_lines = [line for line in raw.splitlines() if line.strip()]
+
+    header_index = next(
+        (
+            i
+            for i, line in enumerate(raw_lines)
+            if line.lstrip().startswith("#HostName,")
+        ),
+        None,
+    )
+
+    if header_index is None:
+        raise RuntimeError("VPN Gate API returned no CSV header")
+
+    header_line = raw_lines[header_index].lstrip()[1:]
+
+    data_lines = [
+        line
+        for line in raw_lines[header_index + 1:]
+        if not line.lstrip().startswith("#")
+    ]
+
+    rows = list(
+        csv.reader(
+            io.StringIO("\n".join([header_line, *data_lines]))
+        )
+    )
+
+    header = rows[0]
 
     records = [
         dict(zip(header, row))
@@ -48,49 +95,71 @@ def main() -> None:
     ]
 
     candidates = []
+    excluded = 0
+    missing_config = 0
+    invalid_config = 0
 
     for row in records:
-        country = row.get("CountryShort", "").upper()
-        config_b64 = row.get("OpenVPN_ConfigData_Base64", "").strip()
+        country = row.get("CountryShort", "").strip().upper()
 
-        if not config_b64 or country in EXCLUDED_COUNTRIES:
+        if country in EXCLUDED_COUNTRIES:
+            excluded += 1
             continue
 
-        try:
-            config = base64.b64decode(config_b64, validate=True)
-            config_text = config.decode("utf-8")
-        except Exception:
-            continue
+        config_value = row.get(
+            "OpenVPN_ConfigData_Base64",
+            ""
+        ).strip()
 
-        if "client" not in config_text or "remote " not in config_text:
+        config_text = decode_config(config_value)
+
+        if config_text is None:
+            if config_value:
+                invalid_config += 1
+            else:
+                missing_config += 1
             continue
 
         candidates.append(
             {
-                "hostname": row.get("HostName", ""),
-                "ip": row.get("IP", ""),
-                "country": row.get("CountryLong", ""),
+                "hostname": row.get("HostName", "").strip(),
+                "ip": row.get("IP", "").strip(),
+                "country": row.get("CountryLong", "").strip(),
                 "country_code": country,
                 "score": number(row.get("Score")),
                 "ping_ms": number(row.get("Ping"), -1),
                 "speed": number(row.get("Speed")),
-                "sessions": int(number(row.get("NumVpnSessions"), 0)),
+                "sessions": int(
+                    number(row.get("NumVpnSessions"), 0)
+                ),
                 "config": config_text,
             }
         )
+
+    print(
+        f"VPN Gate rows: {len(records)}; "
+        f"excluded RU: {excluded}; "
+        f"missing configs: {missing_config}; "
+        f"invalid configs: {invalid_config}; "
+        f"usable: {len(candidates)}"
+    )
 
     candidates.sort(
         key=lambda server: (
             -server["score"],
             -server["speed"],
-            server["ping_ms"] if server["ping_ms"] >= 0 else 10**9,
+            server["ping_ms"]
+            if server["ping_ms"] >= 0
+            else 10**9,
         )
     )
 
     selected = candidates[:MAX_SERVERS]
 
     if not selected:
-        raise RuntimeError("No usable non-RU OpenVPN configurations found")
+        raise RuntimeError(
+            "No usable non-RU OpenVPN configurations found"
+        )
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -113,7 +182,9 @@ def main() -> None:
                 for key in server
                 if key != "config"
             }
-            | {"file": f"configs/{filename}"}
+            | {
+                "file": f"configs/{filename}"
+            }
         )
 
     MANIFEST.write_text(
@@ -126,9 +197,9 @@ def main() -> None:
         encoding="utf-8",
     )
 
-    print(f"Saved {len(selected)} OpenVPN configurations")
-
+    print(
+        f"Saved {len(selected)} OpenVPN configurations"
+    )
 
 if __name__ == "__main__":
     main()
-
